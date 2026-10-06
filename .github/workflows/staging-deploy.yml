@@ -31,7 +31,7 @@ jobs:
           set -euo pipefail
 
           case "$PRIVATE_REPO" in
-            Am607/edit_ai) ;;
+            healthpin/helthpin-backend) ;;
             *)
               echo "Unexpected repository: $PRIVATE_REPO"
               exit 1
@@ -70,7 +70,7 @@ jobs:
         with:
           repository: ${{ github.event.client_payload.repository }}
           ref: ${{ github.event.client_payload.sha }}
-          token: ${{ secrets.EDITAI_PRIVATE_REPO_PAT }}
+          token: ${{ secrets.HEALTHPIN_PRIVATE_REPO_PAT }}
           path: app
 
       - name: Set image tags
@@ -81,7 +81,7 @@ jobs:
           SHORT_SHA="${FULL_SHA:0:12}"
 
           OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          BASE="ghcr.io/${OWNER_LC}/editai-backend"
+          BASE="ghcr.io/${OWNER_LC}/helthpin-backend"
 
           echo "image=${BASE}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "base=${BASE}" >> "$GITHUB_OUTPUT"
@@ -121,7 +121,7 @@ jobs:
         with:
           repository: ${{ github.event.client_payload.repository }}
           ref: ${{ github.event.client_payload.sha }}
-          token: ${{ secrets.EDITAI_PRIVATE_REPO_PAT }}
+          token: ${{ secrets.HEALTHPIN_PRIVATE_REPO_PAT }}
           path: app
 
       - name: Load secrets from Infisical
@@ -130,7 +130,7 @@ jobs:
           method: universal
           client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
           client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
-          project-slug: ${{ secrets.EDITAI_INFISICAL_PROJECT_SLUG }}
+          project-slug: ${{ secrets.HEALTHPIN_INFISICAL_PROJECT_SLUG }}
           env-slug: staging
           secret-path: /backend
           export-type: env
@@ -142,20 +142,20 @@ jobs:
           method: universal
           client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
           client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
-          project-slug: ${{ secrets.EDITAI_INFISICAL_PROJECT_SLUG }}
+          project-slug: ${{ secrets.HEALTHPIN_INFISICAL_PROJECT_SLUG }}
           env-slug: staging
           secret-path: /backend
           export-type: file
           # written to $GITHUB_WORKSPACE/editai-app.env
-          file-output-path: /editai-app.env
+          file-output-path: /healthpin-app.env
 
       - name: Drop deploy-only credentials from app env file
         shell: bash
         run: |
           set -euo pipefail
 
-          src="$GITHUB_WORKSPACE/editai-app.env"
-          out="$GITHUB_WORKSPACE/editai-app.env.filtered"
+          src="$GITHUB_WORKSPACE/healthpin-app.env"
+          out="$GITHUB_WORKSPACE/healthpin-app.env.filtered"
           test -s "$src" || { echo "::error::Infisical env file is empty."; exit 1; }
 
           # Entries are KEY='value' and may span lines. Skip DROPLET_* entries.
@@ -197,7 +197,7 @@ jobs:
           : "${DROPLET_APP_DIR:?missing DROPLET_APP_DIR from Infisical staging}"
           : "${DJANGO_ALLOWED_HOSTS:?missing DJANGO_ALLOWED_HOSTS from Infisical staging}"
 
-          key_path="$RUNNER_TEMP/editai_staging_deploy_key"
+          key_path="$RUNNER_TEMP/healthpin_staging_deploy_key"
 
           printf '%b\n' "$DROPLET_SSH_KEY" > "$key_path"
           chmod 644 "$key_path"
@@ -219,7 +219,7 @@ jobs:
           host: ${{ steps.ssh.outputs.host }}
           username: ${{ steps.ssh.outputs.username }}
           key_path: ${{ steps.ssh.outputs.key_path }}
-          source: app/edit_ai_backend/docker-compose.staging.yml
+          source: docker-compose.staging.yml
           strip_components: 2
           target: ${{ env.DROPLET_APP_DIR }}
 
@@ -452,11 +452,6 @@ jobs:
 
             echo "✅ Staging deployment healthy"
 
-            # --------------------------------------------------
-            # Start/refresh redis + celery worker and beat on the new image
-            # --------------------------------------------------
-
-            docker compose up -d --no-deps redis celery-worker celery-beat
 
             # --------------------------------------------------
             # Cleanup dangling Docker images
@@ -489,7 +484,7 @@ jobs:
           set -euo pipefail
 
           curl -fsS -X POST \
-            -H "Authorization: token ${{ secrets.EDITAI_PRIVATE_REPO_PAT }}" \
+            -H "Authorization: token ${{ secrets.HEALTHPIN_PRIVATE_REPO_PAT }}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${PRIVATE_REPO}/issues/${PR_NUMBER}/comments" \
             -d "$(jq -cn \
@@ -503,7 +498,7 @@ jobs:
           set -euo pipefail
 
           curl -fsS -X POST \
-            -H "Authorization: token ${{ secrets.EDITAI_PRIVATE_REPO_PAT }}" \
+            -H "Authorization: token ${{ secrets.HEALTHPIN_PRIVATE_REPO_PAT }}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${PRIVATE_REPO}/issues/${PR_NUMBER}/comments" \
             -d "$(jq -cn \
