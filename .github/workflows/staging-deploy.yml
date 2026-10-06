@@ -100,7 +100,8 @@ jobs:
       - name: Build and push staging image
         uses: docker/build-push-action@v6
         with:
-          context: healthpin_backend
+          context: app
+          file: app/Dockerfile
           push: true
           tags: |
             ${{ steps.meta.outputs.base }}:${{ steps.meta.outputs.sha }}
@@ -146,7 +147,7 @@ jobs:
           env-slug: staging
           secret-path: /backend
           export-type: file
-          # written to $GITHUB_WORKSPACE/editai-app.env
+          # written to $GITHUB_WORKSPACE/healthpin-app.env
           file-output-path: /healthpin-app.env
 
       - name: Drop deploy-only credentials from app env file
@@ -200,7 +201,7 @@ jobs:
           key_path="$RUNNER_TEMP/healthpin_staging_deploy_key"
 
           printf '%b\n' "$DROPLET_SSH_KEY" > "$key_path"
-          chmod 644 "$key_path"
+          chmod 600 "$key_path"
 
           if ! grep -q 'BEGIN .*PRIVATE KEY' "$key_path"; then
             echo "::error::DROPLET_SSH_KEY must be the full private key, not the .pub key."
@@ -219,8 +220,8 @@ jobs:
           host: ${{ steps.ssh.outputs.host }}
           username: ${{ steps.ssh.outputs.username }}
           key_path: ${{ steps.ssh.outputs.key_path }}
-          source: docker-compose.staging.yml
-          strip_components: 2
+          source: app/docker-compose.staging.yml
+          strip_components: 1
           target: ${{ env.DROPLET_APP_DIR }}
 
 
@@ -230,7 +231,7 @@ jobs:
           host: ${{ steps.ssh.outputs.host }}
           username: ${{ steps.ssh.outputs.username }}
           key_path: ${{ steps.ssh.outputs.key_path }}
-          source: editai-app.env
+          source: healthpin-app.env
           target: ${{ env.DROPLET_APP_DIR }}
 
       - name: SSH in, migrate, swap server, healthcheck, rollback on failure
@@ -285,13 +286,13 @@ jobs:
             # Install the app .env uploaded by the workflow
             # --------------------------------------------------
 
-            test -s editai-app.env || {
-              echo "editai-app.env was not uploaded"
+            test -s healthpin-app.env || {
+              echo "healthpin-app.env was not uploaded"
               exit 1
             }
 
-            chmod 600 editai-app.env
-            mv -f editai-app.env .env
+            chmod 600 healthpin-app.env
+            mv -f healthpin-app.env .env
 
 
             # --------------------------------------------------
@@ -462,7 +463,7 @@ jobs:
       - name: Remove env file from runner
         if: always()
         shell: bash
-        run: rm -f "$GITHUB_WORKSPACE"/editai-app.env "$GITHUB_WORKSPACE"/editai-app.env.filtered "$RUNNER_TEMP"/editai_staging_deploy_key
+        run: rm -f "$GITHUB_WORKSPACE"/healthpin-app.env "$GITHUB_WORKSPACE"/healthpin-app.env.filtered "$RUNNER_TEMP"/healthpin_staging_deploy_key
 
 
 
