@@ -100,7 +100,7 @@ jobs:
       - name: Build and push staging image
         uses: docker/build-push-action@v6
         with:
-          context: app/edit_ai_backend
+          context: app/healthpin_backend
           push: true
           tags: |
             ${{ steps.meta.outputs.base }}:${{ steps.meta.outputs.sha }}
