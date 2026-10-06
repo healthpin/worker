@@ -201,7 +201,10 @@ jobs:
           key_path="$RUNNER_TEMP/healthpin_staging_deploy_key"
 
           printf '%b\n' "$DROPLET_SSH_KEY" > "$key_path"
-          chmod 600 "$key_path"
+          # 644, not 600: appleboy actions run in a container as a different user
+          # and must be able to read the key. The file lives in RUNNER_TEMP and
+          # is removed in the cleanup step.
+          chmod 644 "$key_path"
 
           if ! grep -q 'BEGIN .*PRIVATE KEY' "$key_path"; then
             echo "::error::DROPLET_SSH_KEY must be the full private key, not the .pub key."
