@@ -1,0 +1,512 @@
+name: Healthpin Backend Staging Deploy
+
+"on":
+  repository_dispatch:
+    types: [healthpin-deploy-staging]
+
+concurrency:
+  group: healthpin-staging-${{ github.event.client_payload.pr_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  PRIVATE_REPO: ${{ github.event.client_payload.repository }}
+  SHA: ${{ github.event.client_payload.sha }}
+  PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+  PR_BRANCH: ${{ github.event.client_payload.branch }}
+
+jobs:
+  validate-payload:
+    name: Validate deployment payload
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate payload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$PRIVATE_REPO" in
+            Am607/edit_ai) ;;
+            *)
+              echo "Unexpected repository: $PRIVATE_REPO"
+              exit 1
+              ;;
+          esac
+
+          case "$SHA" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *)
+              echo "SHA must be a full 40-character commit SHA. Got: $SHA"
+              exit 1
+              ;;
+          esac
+
+          case "$PR_NUMBER" in
+            ''|*[!0-9]*)
+              echo "Invalid PR number: $PR_NUMBER"
+              exit 1
+              ;;
+          esac
+
+
+  build-push:
+    name: Build image & push to GHCR
+    needs: validate-payload
+    runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      base: ${{ steps.meta.outputs.base }}
+      sha: ${{ steps.meta.outputs.sha }}
+
+    steps:
+      - name: Checkout edit_ai PR commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.client_payload.repository }}
+          ref: ${{ github.event.client_payload.sha }}
+          token: ${{ secrets.EDITAI_PRIVATE_REPO_PAT }}
+          path: app
+
+      - name: Set image tags
+        id: meta
+        shell: bash
+        run: |
+          FULL_SHA="${{ github.event.client_payload.sha }}"
+          SHORT_SHA="${FULL_SHA:0:12}"
+
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          BASE="ghcr.io/${OWNER_LC}/editai-backend"
+
+          echo "image=${BASE}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push staging image
+        uses: docker/build-push-action@v6
+        with:
+          context: app/edit_ai_backend
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.base }}:${{ steps.meta.outputs.sha }}
+            ${{ steps.meta.outputs.base }}:staging
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+  deploy:
+    name: Migrate, swap & healthcheck staging
+    needs: build-push
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout edit_ai PR commit (compose file)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.client_payload.repository }}
+          ref: ${{ github.event.client_payload.sha }}
+          token: ${{ secrets.EDITAI_PRIVATE_REPO_PAT }}
+          path: app
+
+      - name: Load secrets from Infisical
+        uses: Infisical/secrets-action@v1.0.7
+        with:
+          method: universal
+          client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          project-slug: ${{ secrets.EDITAI_INFISICAL_PROJECT_SLUG }}
+          env-slug: staging
+          secret-path: /backend
+          export-type: env
+
+
+      - name: Export app env file from Infisical
+        uses: Infisical/secrets-action@v1.0.7
+        with:
+          method: universal
+          client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          project-slug: ${{ secrets.EDITAI_INFISICAL_PROJECT_SLUG }}
+          env-slug: staging
+          secret-path: /backend
+          export-type: file
+          # written to $GITHUB_WORKSPACE/editai-app.env
+          file-output-path: /editai-app.env
+
+      - name: Drop deploy-only credentials from app env file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          src="$GITHUB_WORKSPACE/editai-app.env"
+          out="$GITHUB_WORKSPACE/editai-app.env.filtered"
+          test -s "$src" || { echo "::error::Infisical env file is empty."; exit 1; }
+
+          # Entries are KEY='value' and may span lines. Skip DROPLET_* entries.
+          awk -v q="'" '
+            !open && $0 ~ ("^[A-Za-z_][A-Za-z0-9_]*=" q) {
+              skip = ($0 ~ /^DROPLET_/)
+              rem = $0
+              sub("^[^=]*=" q, "", rem)
+              if (rem !~ (q "$")) open = 1
+              if (!skip) print
+              next
+            }
+            open {
+              if ($0 ~ (q "$")) open = 0
+              if (!skip) print
+              next
+            }
+            { if (!skip) print }
+          ' "$src" > "$out"
+
+          rm -f "$src"
+          mv "$out" "$src"
+          chmod 644 "$src"
+
+          if ! test -s "$src" || grep -q 'PRIVATE KEY' "$src" || grep -q '^DROPLET_' "$src"; then
+            echo "::error::App env file is empty or still contains deploy credentials."
+            exit 1
+          fi
+
+      - name: Prepare SSH key
+        id: ssh
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          : "${DROPLET_HOST:?missing DROPLET_HOST from Infisical staging}"
+          : "${DROPLET_USER:?missing DROPLET_USER from Infisical staging}"
+          : "${DROPLET_SSH_KEY:?missing DROPLET_SSH_KEY from Infisical staging}"
+          : "${DROPLET_APP_DIR:?missing DROPLET_APP_DIR from Infisical staging}"
+          : "${DJANGO_ALLOWED_HOSTS:?missing DJANGO_ALLOWED_HOSTS from Infisical staging}"
+
+          key_path="$RUNNER_TEMP/editai_staging_deploy_key"
+
+          printf '%b\n' "$DROPLET_SSH_KEY" > "$key_path"
+          chmod 644 "$key_path"
+
+          if ! grep -q 'BEGIN .*PRIVATE KEY' "$key_path"; then
+            echo "::error::DROPLET_SSH_KEY must be the full private key, not the .pub key."
+            exit 1
+          fi
+
+          {
+            echo "host=$DROPLET_HOST"
+            echo "username=$DROPLET_USER"
+            echo "key_path=$key_path"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload compose file to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ steps.ssh.outputs.host }}
+          username: ${{ steps.ssh.outputs.username }}
+          key_path: ${{ steps.ssh.outputs.key_path }}
+          source: app/edit_ai_backend/docker-compose.staging.yml
+          strip_components: 2
+          target: ${{ env.DROPLET_APP_DIR }}
+
+
+      - name: Upload app env file to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ steps.ssh.outputs.host }}
+          username: ${{ steps.ssh.outputs.username }}
+          key_path: ${{ steps.ssh.outputs.key_path }}
+          source: editai-app.env
+          target: ${{ env.DROPLET_APP_DIR }}
+
+      - name: SSH in, migrate, swap server, healthcheck, rollback on failure
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE: ${{ needs.build-push.outputs.image }}
+          IMAGE_BASE: ${{ needs.build-push.outputs.base }}
+
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_PAT: ${{ env.GHCR_PAT }}
+
+          DROPLET_APP_DIR: ${{ env.DROPLET_APP_DIR }}
+          DJANGO_ALLOWED_HOSTS: ${{ env.DJANGO_ALLOWED_HOSTS }}
+
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          PR_BRANCH: ${{ env.PR_BRANCH }}
+          SHA: ${{ env.SHA }}
+
+        with:
+          host: ${{ steps.ssh.outputs.host }}
+          username: ${{ steps.ssh.outputs.username }}
+          key_path: ${{ steps.ssh.outputs.key_path }}
+
+          envs: IMAGE,IMAGE_BASE,GHCR_USERNAME,GHCR_PAT,DROPLET_APP_DIR,DJANGO_ALLOWED_HOSTS,PR_NUMBER,PR_BRANCH,SHA
+
+          command_timeout: 30m
+
+          script: |
+            set -euo pipefail
+
+            : "${DROPLET_APP_DIR:?missing DROPLET_APP_DIR}"
+
+            cd "$DROPLET_APP_DIR"
+
+            echo "Deploying PR #${PR_NUMBER} (${PR_BRANCH}) at ${SHA}"
+            echo "Image: ${IMAGE}"
+
+            # --------------------------------------------------
+            # Make sure compose configuration exists
+            # --------------------------------------------------
+
+            test -f docker-compose.staging.yml || {
+              echo "docker-compose.staging.yml not found"
+              exit 1
+            }
+
+            export COMPOSE_FILE="docker-compose.staging.yml"
+
+            echo "Using Compose files: $COMPOSE_FILE"
+
+            # --------------------------------------------------
+            # Install the app .env uploaded by the workflow
+            # --------------------------------------------------
+
+            test -s editai-app.env || {
+              echo "editai-app.env was not uploaded"
+              exit 1
+            }
+
+            chmod 600 editai-app.env
+            mv -f editai-app.env .env
+
+
+            # --------------------------------------------------
+            # GHCR login
+            # --------------------------------------------------
+
+            echo "$GHCR_PAT" | docker login ghcr.io \
+              -u "$GHCR_USERNAME" \
+              --password-stdin
+
+            # --------------------------------------------------
+            # Save current image for rollback
+            # --------------------------------------------------
+
+            PREV_IMAGE="$(
+              docker compose ps --format '{{.Image}}' server \
+              2>/dev/null | head -n1 || true
+            )"
+
+            echo "Previous staging image: ${PREV_IMAGE:-<none>}"
+            echo "New staging image: $IMAGE"
+
+            export IMAGE
+
+            # --------------------------------------------------
+            # Pull new image
+            # --------------------------------------------------
+
+            docker compose pull server
+
+            # --------------------------------------------------
+            # Ensure staging database is running
+            # --------------------------------------------------
+
+            docker compose up -d db
+
+            db_status="starting"
+
+            for i in $(seq 1 30); do
+              DB_CONTAINER="$(docker compose ps -q db)"
+
+              db_status="$(
+                docker inspect \
+                  --format='{{.State.Health.Status}}' \
+                  "$DB_CONTAINER" \
+                  2>/dev/null || echo starting
+              )"
+
+              echo "db health[$i]: $db_status"
+
+              [ "$db_status" = "healthy" ] && break
+
+              sleep 2
+            done
+
+            if [ "$db_status" != "healthy" ]; then
+              echo "::error::Staging database not healthy"
+              docker compose logs --tail=100 db
+              exit 1
+            fi
+
+            # --------------------------------------------------
+            # Run migrations using NEW image before swap
+            # --------------------------------------------------
+
+            if ! docker compose run --rm server \
+              python manage.py migrate --noinput; then
+
+              echo "::error::Migration failed."
+              echo "Existing staging server has NOT been replaced."
+              exit 1
+            fi
+
+            # --------------------------------------------------
+            # Swap staging server
+            # --------------------------------------------------
+
+            if ! docker compose up \
+              -d \
+              --no-deps \
+              --remove-orphans \
+              server; then
+
+              echo "::error::Failed to start new staging server."
+
+              if [ -n "$PREV_IMAGE" ]; then
+                echo "Rolling back to $PREV_IMAGE"
+
+                IMAGE="$PREV_IMAGE" \
+                  docker compose up -d --no-deps server || true
+              fi
+
+              exit 1
+            fi
+
+            # --------------------------------------------------
+            # Wait for Docker healthcheck
+            # --------------------------------------------------
+
+            health_status="starting"
+
+            for i in $(seq 1 30); do
+              SERVER_CONTAINER="$(docker compose ps -q server)"
+
+              health_status="$(
+                docker inspect \
+                  --format='{{.State.Health.Status}}' \
+                  "$SERVER_CONTAINER" \
+                  2>/dev/null || echo starting
+              )"
+
+              echo "server health[$i]: $health_status"
+
+              [ "$health_status" = "healthy" ] && break
+              [ "$health_status" = "unhealthy" ] && break
+
+              sleep 2
+            done
+
+            # --------------------------------------------------
+            # Rollback if unhealthy
+            # --------------------------------------------------
+
+            if [ "$health_status" != "healthy" ]; then
+              echo "::error::Staging server unhealthy."
+
+              docker compose logs --tail=100 server || true
+
+              if [ -n "$PREV_IMAGE" ]; then
+                echo "Rolling back to $PREV_IMAGE"
+
+                IMAGE="$PREV_IMAGE" \
+                  docker compose up -d --no-deps server
+              fi
+
+              exit 1
+            fi
+
+            # --------------------------------------------------
+            # Extra host-level health check through port 80
+            # --------------------------------------------------
+
+            if ! curl -fsS \
+              -H "Host: ${DJANGO_ALLOWED_HOSTS%%,*}" \
+              http://127.0.0.1:8000/admin/login/ >/dev/null; then
+
+              echo "::error::Host healthcheck failed on 127.0.0.1:8000"
+
+              if [ -n "$PREV_IMAGE" ]; then
+                echo "Rolling back to $PREV_IMAGE"
+
+                IMAGE="$PREV_IMAGE" \
+                  docker compose up -d --no-deps server
+              fi
+
+              exit 1
+            fi
+
+            echo "✅ Staging deployment healthy"
+
+            # --------------------------------------------------
+            # Start/refresh redis + celery worker and beat on the new image
+            # --------------------------------------------------
+
+            docker compose up -d --no-deps redis celery-worker celery-beat
+
+            # --------------------------------------------------
+            # Cleanup dangling Docker images
+            # --------------------------------------------------
+
+            docker image prune -f
+
+      - name: Remove env file from runner
+        if: always()
+        shell: bash
+        run: rm -f "$GITHUB_WORKSPACE"/editai-app.env "$GITHUB_WORKSPACE"/editai-app.env.filtered "$RUNNER_TEMP"/editai_staging_deploy_key
+
+
+
+  notify-pr:
+    name: Comment deployment status on PR
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+
+    env:
+      PRIVATE_REPO: ${{ github.event.client_payload.repository }}
+      PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+      SHA: ${{ github.event.client_payload.sha }}
+
+    steps:
+      - name: Comment deployment status on PR (success)
+        if: needs.deploy.result == 'success'
+        run: |
+          set -euo pipefail
+
+          curl -fsS -X POST \
+            -H "Authorization: token ${{ secrets.EDITAI_PRIVATE_REPO_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PRIVATE_REPO}/issues/${PR_NUMBER}/comments" \
+            -d "$(jq -cn \
+              --arg sha "$SHA" \
+              --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              '{body:("✅ Staging deployment succeeded for `" + $sha + "`\n\n" + $run)}')"
+
+      - name: Comment deployment status on PR (failure)
+        if: needs.deploy.result != 'success'
+        run: |
+          set -euo pipefail
+
+          curl -fsS -X POST \
+            -H "Authorization: token ${{ secrets.EDITAI_PRIVATE_REPO_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PRIVATE_REPO}/issues/${PR_NUMBER}/comments" \
+            -d "$(jq -cn \
+              --arg sha "$SHA" \
+              --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              '{body:("❌ Staging deployment failed for `" + $sha + "`\n\nRun logs: " + $run)}')"
